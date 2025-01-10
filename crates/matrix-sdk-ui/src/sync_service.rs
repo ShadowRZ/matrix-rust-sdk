@@ -24,7 +24,7 @@
 //! [`SyncService::start()`] again to restart the room list sync.
 
 use std::sync::{Arc, Mutex};
-
+use std::time::SystemTime;
 use eyeball::{SharedObservable, Subscriber};
 use futures_core::Future;
 use futures_util::{pin_mut, StreamExt as _};
@@ -307,6 +307,9 @@ impl SyncService {
     ///   and restarted.
     pub async fn start(&self) {
         let _guard = self.modifying_state.lock().await;
+
+        let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_secs((secs.as_millis() % 6) as u64)).await;
 
         // Only (re)start the tasks if any was stopped.
         if matches!(self.state.get(), State::Running) {
