@@ -62,13 +62,16 @@ impl Deduplicator {
             .estimated_insertions(Self::APPROXIMATED_MAXIMUM_NUMBER_OF_EVENTS)
             .desired_error_ratio(Self::DESIRED_FALSE_POSITIVE_RATE)
             .build();
-        for e in events {
-            let Some(event_id) = e.event_id() else {
+
+        for event in events {
+            let Some(event_id) = event.event_id() else {
                 warn!("initial event in deduplicator had no event id");
                 continue;
             };
+
             bloom_filter.insert(event_id);
         }
+
         Self { bloom_filter: Mutex::new(bloom_filter) }
     }
 

@@ -578,10 +578,10 @@ mod private {
     impl RoomEventCacheState {
         async fn try_reload_linked_chunk(
             room: &RoomId,
-            locked: &EventCacheStoreLockGuard<'_>,
+            store: &EventCacheStoreLockGuard<'_>,
         ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, EventCacheError>
         {
-            let raw_chunks = locked.reload_linked_chunk(room).await?;
+            let raw_chunks = store.reload_linked_chunk(room).await?;
 
             let mut builder = LinkedChunkBuilder::from_raw_parts(raw_chunks.clone());
 
@@ -606,17 +606,17 @@ mod private {
             store: Arc<OnceCell<EventCacheStoreLock>>,
         ) -> Result<Self, EventCacheError> {
             let events = if let Some(store) = store.get() {
-                let locked = store.lock().await?;
+                let store = store.lock().await?;
 
                 // Try to reload a linked chunk from storage. If it fails, log the error and
                 // restart with a fresh, empty linked chunk.
-                let linked_chunk = match Self::try_reload_linked_chunk(&room, &locked).await {
+                let linked_chunk = match Self::try_reload_linked_chunk(&room, &store).await {
                     Ok(linked_chunk) => linked_chunk,
                     Err(err) => {
                         error!("error when reloading a linked chunk from memory: {err}");
 
                         // Clear storage for this room.
-                        locked.handle_linked_chunk_updates(&room, vec![Update::Clear]).await?;
+                        store.handle_linked_chunk_updates(&room, vec![Update::Clear]).await?;
 
                         // Restart with an empty linked chunk.
                         None
