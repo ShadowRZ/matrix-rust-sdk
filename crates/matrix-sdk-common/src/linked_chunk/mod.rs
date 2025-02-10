@@ -1009,7 +1009,8 @@ unsafe impl<const CAP: usize, Item: Sync, Gap: Sync> Sync for LinkedChunk<CAP, I
 /// (see [`ChunkIdentifier`]). Generating a new unique identifier boils down to
 /// incrementing by one the previous identifier. Note that this is not an index:
 /// it _is_ an identifier.
-struct ChunkIdentifierGenerator {
+#[derive(Debug)]
+pub struct ChunkIdentifierGenerator {
     next: AtomicU64,
 }
 
@@ -1033,7 +1034,7 @@ impl ChunkIdentifierGenerator {
     ///
     /// Note that it can fail if there is no more unique identifier available.
     /// In this case, this method will panic.
-    pub fn next(&self) -> ChunkIdentifier {
+    fn next(&self) -> ChunkIdentifier {
         let previous = self.next.fetch_add(1, Ordering::Relaxed);
 
         // Check for overflows.
