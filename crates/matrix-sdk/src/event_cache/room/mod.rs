@@ -529,23 +529,19 @@ mod private {
     use eyeball_im::VectorDiff;
     use matrix_sdk_base::{
         deserialized_responses::{TimelineEvent, TimelineEventKind},
-        event_cache::{
-            store::{
-                EventCacheStoreError, EventCacheStoreLock, EventCacheStoreLockGuard,
-                DEFAULT_CHUNK_CAPACITY,
-            },
-            Event, Gap,
-        },
-        linked_chunk::{LinkedChunk, LinkedChunkBuilder, RawChunk, Update},
+        event_cache::{store::EventCacheStoreLock, Event},
+        linked_chunk::{LinkedChunkBuilder, Update},
     };
     use once_cell::sync::OnceCell;
-    use ruma::{serde::Raw, OwnedEventId, OwnedRoomId, RoomId};
+    use ruma::{serde::Raw, OwnedEventId, OwnedRoomId};
     use tracing::{debug, error, instrument, trace, warn};
 
-    use super::{chunk_debug_string, events::RoomEvents};
-    use crate::event_cache::{
-        deduplicator::{Decoration, Deduplicator},
-        EventCacheError,
+    use super::{
+        super::{
+            deduplicator::{Decoration, Deduplicator},
+            EventCacheError,
+        },
+        events::RoomEvents,
     };
 
     /// State for a single room's event cache.
@@ -576,54 +572,44 @@ mod private {
     }
 
     impl RoomEventCacheState {
-        async fn try_reload_linked_chunk(
-            room: &RoomId,
-            store: &EventCacheStoreLockGuard<'_>,
-        ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, EventCacheError>
-        {
-            let raw_chunks = store.reload_linked_chunk(room).await?;
-
-            let mut builder = LinkedChunkBuilder::from_raw_parts(raw_chunks.clone());
-
-            builder.with_update_history();
-
-            Ok(builder.build().map_err(|err| {
-                // Show a debug string representing the known chunks.
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    trace!("couldn't build a linked chunk from the raw parts. Raw chunks:");
-                    for line in raw_chunks_debug_string(raw_chunks) {
-                        trace!("{line}");
-                    }
-                }
-
-                EventCacheStoreError::InvalidData { details: err.to_string() }
-            })?)
-        }
-
         /// Create a new state, or reload it from storage if it's been enabled.
+        ///
+        /// Not all events are going to be loaded. Only a portion of them. The
+        /// [`RoomEvents`] relies on a [`LinkedChunk`] to store all events. Only
+        /// the last chunk will be loaded. It means the events are loaded from
+        /// the most recents to the oldest. To load more events, see
+        /// [`Self::load_more_events_backwards`].
+        ///
+        /// [`LinkedChunk`]: matrix_sdk_common::linked_chunk::LinkedChunk
         pub async fn new(
-            room: OwnedRoomId,
+            room_id: OwnedRoomId,
             store: Arc<OnceCell<EventCacheStoreLock>>,
         ) -> Result<Self, EventCacheError> {
             let events = if let Some(store) = store.get() {
                 let store = store.lock().await?;
 
-                // Try to reload a linked chunk from storage. If it fails, log the error and
-                // restart with a fresh, empty linked chunk.
-                let linked_chunk = match Self::try_reload_linked_chunk(&room, &store).await {
+                let linked_chunk = match store
+                    .load_last_chunk(&room_id)
+                    .await
+                    .map_err(EventCacheError::from)
+                    .and_then(|(last_chunk, chunk_identifier_generator)| {
+                        LinkedChunkBuilder::from_last_chunk(last_chunk, chunk_identifier_generator)
+                            .map_err(EventCacheError::from)
+                    }) {
                     Ok(linked_chunk) => linked_chunk,
+
                     Err(err) => {
                         error!("error when reloading a linked chunk from memory: {err}");
 
                         // Clear storage for this room.
-                        store.handle_linked_chunk_updates(&room, vec![Update::Clear]).await?;
+                        store.handle_linked_chunk_updates(&room_id, vec![Update::Clear]).await?;
 
                         // Restart with an empty linked chunk.
                         None
                     }
                 };
 
-                RoomEvents::with_initial_chunks(linked_chunk)
+                RoomEvents::with_initial_linked_chunk(linked_chunk)
             } else {
                 RoomEvents::default()
             };
@@ -631,10 +617,16 @@ mod private {
             let deduplicator =
                 Deduplicator::with_initial_events(events.events().map(|(_pos, event)| event));
 
-            Ok(Self { room, store, events, deduplicator, waited_for_initial_prev_token: false })
+            Ok(Self {
+                room: room_id,
+                store,
+                events,
+                deduplicator,
+                waited_for_initial_prev_token: false,
+            })
         }
 
-        /// Deduplicate `events` considering all events in `Self::chunks`.
+        /// Deduplicate `events` considering all events in `Self::events`.
         ///
         /// The returned tuple contains:
         /// - all events (duplicated or not) with an ID
@@ -833,72 +825,6 @@ mod private {
             self.propagate_changes().await?;
             let updates_as_vector_diffs = self.events.updates_as_vector_diffs();
             Ok((output, updates_as_vector_diffs))
-        }
-    }
-
-    /// Create a debug string over multiple lines (one String per line),
-    /// offering a debug representation of a [`RawChunk`] loaded from disk.
-    fn raw_chunks_debug_string(mut raw_chunks: Vec<RawChunk<Event, Gap>>) -> Vec<String> {
-        let mut result = Vec::new();
-
-        // Sort the chunks by id, for the output to be deterministic.
-        raw_chunks.sort_by_key(|c| c.identifier.index());
-
-        for c in raw_chunks {
-            let content = chunk_debug_string(&c.content);
-
-            let prev =
-                c.previous.map_or_else(|| "<none>".to_owned(), |prev| prev.index().to_string());
-            let next = c.next.map_or_else(|| "<none>".to_owned(), |prev| prev.index().to_string());
-
-            let line =
-                format!("chunk #{} (prev={prev}, next={next}): {content}", c.identifier.index());
-
-            result.push(line);
-        }
-
-        result
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use matrix_sdk_base::{
-            event_cache::Gap,
-            linked_chunk::{ChunkContent, ChunkIdentifier as CId, RawChunk},
-        };
-        use matrix_sdk_test::{event_factory::EventFactory, ALICE, DEFAULT_TEST_ROOM_ID};
-        use ruma::event_id;
-
-        use super::raw_chunks_debug_string;
-
-        #[test]
-        fn test_raw_chunks_debug_string() {
-            let mut raws = Vec::new();
-            let f = EventFactory::new().room(&DEFAULT_TEST_ROOM_ID).sender(*ALICE);
-
-            raws.push(RawChunk {
-                content: ChunkContent::Items(vec![
-                    f.text_msg("hey")
-                        .event_id(event_id!("$123456789101112131415617181920"))
-                        .into_event(),
-                    f.text_msg("you").event_id(event_id!("$2")).into_event(),
-                ]),
-                identifier: CId::new(1),
-                previous: Some(CId::new(0)),
-                next: None,
-            });
-
-            raws.push(RawChunk {
-                content: ChunkContent::Gap(Gap { prev_token: "prev-token".to_owned() }),
-                identifier: CId::new(0),
-                previous: None,
-                next: Some(CId::new(1)),
-            });
-
-            let output = raw_chunks_debug_string(raws);
-            assert_eq!(output.len(), 2);
-            assert_eq!(&output[0], "chunk #0 (prev=<none>, next=1): gap['prev-token']");
-            assert_eq!(&output[1], "chunk #1 (prev=0, next=<none>): events[$12345678, $2]");
         }
     }
 }
