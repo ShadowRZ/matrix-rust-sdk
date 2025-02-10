@@ -121,6 +121,37 @@ impl RoomPagination {
     async fn run_backwards_impl(&self, batch_size: u16) -> Result<Option<BackPaginationOutcome>> {
         const DEFAULT_WAIT_FOR_TOKEN_DURATION: Duration = Duration::from_secs(3);
 
+        // First off, remember that's the `RoomEvents` might be partially loaded
+        // (because not all events are fully loaded).
+        //
+        // Knowing that, let's try to load more events from the storage. If there is
+        // nothing from the storage, let's fallback on the network.
+        {
+            let mut state = self.inner.state.write().await;
+
+            // Try to load one chunk backwards. If it returns `Some(_)`, it means new events
+            // have been inserted. No need to reach the network!
+            if let Some(((events, reached_start), sync_timeline_events_diffs)) =
+                state.load_more_events_backwards().await?
+            {
+                if !sync_timeline_events_diffs.is_empty() {
+                    let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
+                        diffs: sync_timeline_events_diffs,
+                        origin: EventsOrigin::Pagination,
+                    });
+                }
+
+                return Ok(Some(BackPaginationOutcome {
+                    reached_start,
+                    // This is a backwards pagination. `BackPaginationOutcome` expects events to be
+                    // in “reverse order”.
+                    events: events.into_iter().rev().collect(),
+                }));
+            }
+        }
+
+        // Now we can fallback onto the network.
+
         let prev_token = self.get_or_wait_for_token(Some(DEFAULT_WAIT_FOR_TOKEN_DURATION)).await;
 
         let prev_token = match prev_token {
