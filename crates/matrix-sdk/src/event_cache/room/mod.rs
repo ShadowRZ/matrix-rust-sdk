@@ -530,7 +530,7 @@ mod private {
     use matrix_sdk_base::{
         deserialized_responses::{TimelineEvent, TimelineEventKind},
         event_cache::{store::EventCacheStoreLock, Event},
-        linked_chunk::{LinkedChunkBuilder, Update},
+        linked_chunk::{ChunkContent, LinkedChunkBuilder, Update},
     };
     use once_cell::sync::OnceCell;
     use ruma::{serde::Raw, OwnedEventId, OwnedRoomId};
@@ -693,6 +693,76 @@ mod private {
             (events, duplicated_event_ids, all_duplicates)
         }
 
+        /// Load more events backwards if the last chunk is **not** a gap.
+        ///
+        /// Return `Ok(Some((events, reached_start), _))` if events have been
+        /// inserted, `Ok(None)` if a gap has been inserted or if the
+        /// store is disabled.
+        #[must_use = "Updates as `VectorDiff` must probably be propagated via `RoomEventCacheUpdate`"]
+        pub(in super::super) async fn load_more_events_backwards(
+            &mut self,
+        ) -> Result<
+            Option<((Vec<TimelineEvent>, bool), Vec<VectorDiff<TimelineEvent>>)>,
+            EventCacheError,
+        > {
+            let Some(store) = self.store.get() else {
+                // No store: no events to insert.
+                return Ok(None);
+            };
+
+            let first_chunk = self
+                .events
+                .chunks()
+                .next()
+                // SAFETY: A `LinkedChunk` is never empty, it always contains at least one chunk.
+                .expect("The `LinkedChunk` in `RoomEvents` cannot be empty");
+
+            // Because `first_chunk` is `not `Send`, get these information before the
+            // `.await` point, so that this `Future` can implement `Send`.
+            let first_chunk_is_gap = first_chunk.is_gap();
+            let first_chunk_identifier = first_chunk.identifier();
+
+            // The first chunk is a gap. Don't load more events! The gap must be resolved.
+            if first_chunk_is_gap {
+                return Ok(None);
+            }
+
+            let room_id = &self.room;
+            let store = store.lock().await?;
+
+            // The first chunk is not a gap, we can load its previous chunk.
+            let Some(new_first_chunk) =
+                store.load_previous_chunk(room_id, first_chunk_identifier).await?
+            else {
+                // No previous chunk: no events to insert.
+                return Ok(None);
+            };
+
+            let result = match &new_first_chunk.content {
+                ChunkContent::Gap(_) => None,
+                ChunkContent::Items(items) => {
+                    Some((
+                        // Clone the items/events.
+                        items.clone(),
+                        // If the chunk has **no** previous chunk, it means we did hit the start
+                        // of the timeline.
+                        new_first_chunk.previous.is_none(),
+                    ))
+                }
+            };
+
+            self.events.insert_new_chunk_as_first(new_first_chunk)?;
+
+            // ⚠️ Let's not propagate the updates to the store! We already have these data
+            // in the store! Let's drain them.
+            let _ = self.events.updates().take();
+
+            // However, we want to get updates as `VectorDiff`s.
+            let updates_as_vector_diffs = self.events.updates_as_vector_diffs();
+
+            Ok(result
+                .map(|(events, reached_start)| ((events, reached_start), updates_as_vector_diffs)))
+        }
         /// Removes the bundled relations from an event, if they were present.
         ///
         /// Only replaces the present if it contained bundled relations.
