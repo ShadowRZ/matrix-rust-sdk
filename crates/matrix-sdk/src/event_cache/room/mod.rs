@@ -1401,7 +1401,7 @@ mod tests {
 
         let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
 
-        let (items, mut stream) = room_event_cache.subscribe().await.unwrap();
+        let (items, mut stream) = room_event_cache.subscribe().await;
 
         // The rooms knows about some cached events.
         {
@@ -1451,7 +1451,7 @@ mod tests {
         // The room event cache has forgotten about the events.
         assert!(room_event_cache.event(event_id1).await.is_none());
 
-        let (items, _) = room_event_cache.subscribe().await.unwrap();
+        let (items, _) = room_event_cache.subscribe().await;
         assert!(items.is_empty());
 
         // The event cache store too.
