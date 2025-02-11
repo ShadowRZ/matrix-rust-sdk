@@ -15,18 +15,20 @@ use matrix_sdk::{
         paginator::PaginatorState, BackPaginationOutcome, EventCacheError, PaginationToken,
         RoomEventCacheUpdate, TimelineHasBeenResetWhilePaginating,
     },
+    linked_chunk::{ChunkIdentifier, Position, Update},
     test_utils::{
         assert_event_matches_msg,
         mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
     },
 };
+use matrix_sdk_base::event_cache::Gap;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, GlobalAccountDataTestEvent, JoinedRoomBuilder,
+    async_test, event_factory::EventFactory, GlobalAccountDataTestEvent, JoinedRoomBuilder, ALICE,
 };
 use ruma::{
     event_id,
     events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent},
-    room_id, user_id, RoomVersionId,
+    room_id, user_id, EventId, RoomVersionId,
 };
 use serde_json::json;
 use tokio::{spawn, sync::broadcast, time::sleep};
@@ -1607,4 +1609,257 @@ async fn test_apply_redaction_when_redacted_and_redaction_are_in_same_sync() {
 
     // That's all, folks!
     assert!(subscriber.is_empty());
+}
+
+macro_rules! assert_event_id {
+    ($timeline_event:expr, $event_id:literal) => {
+        assert_eq!($timeline_event.event_id().unwrap().as_str(), $event_id);
+    };
+}
+
+#[async_test]
+async fn test_lazy_loading() {
+    let room_id = room_id!("!foo:bar.baz");
+    let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
+
+    let mock_server = MatrixMockServer::new().await;
+    let client = mock_server.client_builder().build().await;
+
+    // Set up the event cache store.
+    {
+        let event_cache_store = client.event_cache_store().lock().await.unwrap();
+
+        // The event cache contains 4 chunks as such (from newest to older):
+        // 4. a chunk of 7 items
+        // 3. a chunk of 5 items
+        // 2. a chunk of a gap
+        // 1. a chunk of 6 items
+        event_cache_store
+            .handle_linked_chunk_updates(
+                room_id,
+                vec![
+                    // chunk #1
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    // … and its 6 items
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: (0..6)
+                            .map(|nth| {
+                                event_factory
+                                    .text_msg("foo")
+                                    .event_id(&EventId::parse(format!("$ev0_{nth}")).unwrap())
+                                    .into_event()
+                            })
+                            .collect::<Vec<_>>(),
+                    },
+                    // chunk #2
+                    Update::NewGapChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                        gap: Gap { prev_token: "raclette".to_owned() },
+                    },
+                    // chunk #3
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(1)),
+                        new: ChunkIdentifier::new(2),
+                        next: None,
+                    },
+                    // … and its 5 items
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(2), 0),
+                        items: (0..5)
+                            .map(|nth| {
+                                event_factory
+                                    .text_msg("foo")
+                                    .event_id(&EventId::parse(format!("$ev2_{nth}")).unwrap())
+                                    .into_event()
+                            })
+                            .collect::<Vec<_>>(),
+                    },
+                    // chunk #4
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(2)),
+                        new: ChunkIdentifier::new(3),
+                        next: None,
+                    },
+                    // … and its 7 items
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(3), 0),
+                        items: (0..7)
+                            .map(|nth| {
+                                event_factory
+                                    .text_msg("foo")
+                                    .event_id(&EventId::parse(format!("$ev3_{nth}")).unwrap())
+                                    .into_event()
+                            })
+                            .collect::<Vec<_>>(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Set up the event cache.
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+    event_cache.enable_storage().unwrap();
+
+    let room = mock_server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _room_event_cache_drop_handle) = room.event_cache().await.unwrap();
+
+    let (initial_updates, mut updates_stream) = room_event_cache.subscribe().await;
+
+    // Initial events!
+    //
+    // Only 7 events are loaded! They are from the last chunk.
+    {
+        assert_eq!(initial_updates.len(), 7);
+
+        // Yummy, exactly what we expect!
+        assert_event_id!(initial_updates[0], "$ev3_0");
+        assert_event_id!(initial_updates[1], "$ev3_1");
+        assert_event_id!(initial_updates[2], "$ev3_2");
+        assert_event_id!(initial_updates[3], "$ev3_3");
+        assert_event_id!(initial_updates[4], "$ev3_4");
+        assert_event_id!(initial_updates[5], "$ev3_5");
+        assert_event_id!(initial_updates[6], "$ev3_6");
+
+        // The stream of updates is waiting, patiently.
+        assert!(updates_stream.is_empty());
+    }
+
+    // Let's paginate to load more!
+    //
+    // One more chunkw will be loaded from the store. This new chunk contains 5
+    // items. No need to reach the network.
+    {
+        let pagination_outcome =
+            room_event_cache.pagination().run_backwards(10, once).await.unwrap();
+
+        // Oh! 5 events! How classy.
+        assert_eq!(pagination_outcome.events.len(), 5);
+
+        // Hello you. Well… Uoy olleh! Remember, this is a backwards pagination, so
+        // events are returned in reverse order.
+        assert_event_id!(pagination_outcome.events[0], "$ev2_4");
+        assert_event_id!(pagination_outcome.events[1], "$ev2_3");
+        assert_event_id!(pagination_outcome.events[2], "$ev2_2");
+        assert_event_id!(pagination_outcome.events[3], "$ev2_1");
+        assert_event_id!(pagination_outcome.events[4], "$ev2_0");
+
+        // And there is more!
+        assert!(pagination_outcome.reached_start.not());
+
+        // Let's check the stream. It should reflect what the
+        // `pagination_outcome` provides.
+        let update = updates_stream.recv().await.unwrap();
+
+        assert_matches!(update, RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. } => {
+            // 5 diffs?! *feigns surprise*
+            assert_eq!(diffs.len(), 5);
+
+            // Hello you. Again. This time in the expected order.
+            assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value: event } => {
+                assert_event_id!(event, "$ev2_0");
+            });
+            assert_matches!(&diffs[1], VectorDiff::Insert { index: 1, value: event } => {
+                assert_event_id!(event, "$ev2_1");
+            });
+            assert_matches!(&diffs[2], VectorDiff::Insert { index: 2, value: event } => {
+                assert_event_id!(event, "$ev2_2");
+            });
+            assert_matches!(&diffs[3], VectorDiff::Insert { index: 3, value: event } => {
+                assert_event_id!(event, "$ev2_3");
+            });
+            assert_matches!(&diffs[4], VectorDiff::Insert { index: 4, value: event } => {
+                assert_event_id!(event, "$ev2_4");
+            });
+        });
+
+        assert!(updates_stream.is_empty());
+    }
+
+    // This is a funny game. We are having fun, don't we? Let's paginate to load
+    // moaare!
+    //
+    // One more chunk will be loaded from the store. This new chunk contains a
+    // gap. Network will be reached. 4 events will be received, and inserted in the
+    // event cache store, forever 🫶..
+    {
+        let _network_pagination = mock_server
+            .mock_room_messages()
+            .from("raclette")
+            .ok(RoomMessagesResponseTemplate::default().end_token("numerobis").events({
+                (0..4)
+                    // Backwards pagination implies events are in “reverse order”.
+                    .rev()
+                    .map(|nth| {
+                        event_factory
+                            .text_msg("foo")
+                            .event_id(&EventId::parse(format!("$ev1_{nth}")).unwrap())
+                    })
+                    .collect::<Vec<_>>()
+            }))
+            .mock_once()
+            .mount_as_scoped()
+            .await;
+
+        let pagination_outcome =
+            room_event_cache.pagination().run_backwards(10, once).await.unwrap();
+
+        // 🙈… 4 events! Of course. We've never doubt.
+        assert_eq!(pagination_outcome.events.len(), 4);
+
+        // Hello you, in reverse order because this is a backward pagination.
+        assert_event_id!(pagination_outcome.events[0], "$ev1_3");
+        assert_event_id!(pagination_outcome.events[1], "$ev1_2");
+        assert_event_id!(pagination_outcome.events[2], "$ev1_1");
+        assert_event_id!(pagination_outcome.events[3], "$ev1_0");
+
+        // And there is more because we didn't reach the start of the timeline yet.
+        assert!(pagination_outcome.reached_start.not());
+
+        // Let's check the stream. It should reflect what the
+        // `pagination_outcome` provides.
+        let update = updates_stream.recv().await.unwrap();
+
+        assert_matches!(update, RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. } => {
+            // 1, 2, 3, 4 diffs!
+            assert_eq!(diffs.len(), 4);
+
+            // Hello you. Again. And again, in the expected order.
+            assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value: event } => {
+                assert_event_id!(event, "$ev1_0");
+            });
+            assert_matches!(&diffs[1], VectorDiff::Insert { index: 1, value: event } => {
+                assert_event_id!(event, "$ev1_1");
+            });
+            assert_matches!(&diffs[2], VectorDiff::Insert { index: 2, value: event } => {
+                assert_event_id!(event, "$ev1_2");
+            });
+            assert_matches!(&diffs[3], VectorDiff::Insert { index: 3, value: event } => {
+                assert_event_id!(event, "$ev1_3");
+            });
+        });
+
+        assert!(updates_stream.is_empty());
+    }
+
+    // More interesting now. Let's paginate again!
+    //
+    // A new chunk containing a gap has been inserted by the previous network
+    // pagination, because it contained an `end` token. Let's see how the
+    // `EventCache` will reconciliate all that. A new chunk will not be loaded from
+    // the store because the last chunk is a gap.
+    //
+    // The new network pagination will return 1 new event, and 1 event already
+    // known. The complex part is: how to detect if an event is known if not all
+    // events are loaded in memory? This is what we mostly test here.
+    {}
 }
