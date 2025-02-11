@@ -1050,6 +1050,14 @@ impl ChunkIdentifierGenerator {
 
         ChunkIdentifier(previous + 1)
     }
+
+    /// Get the current chunk identifier.
+    //
+    // This is hidden because it's used only in the tests.
+    #[doc(hidden)]
+    pub fn current(&self) -> ChunkIdentifier {
+        ChunkIdentifier(self.next.load(Ordering::Relaxed))
+    }
 }
 
 /// The unique identifier of a chunk in a [`LinkedChunk`].

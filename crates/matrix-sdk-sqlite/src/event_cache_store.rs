@@ -633,9 +633,15 @@ impl EventCacheStore for SqliteEventCacheStore {
                     .query_row(
                         (&hashed_room_id,),
                         |row| {
-                            row.get::<_, u64>(0)
+                            // Read the `MAX(id)` as an `Option<u64>` instead
+                            // of `u64` in case the `SELECT` returns nothing.
+                            // Indeed, if it returns no line, the `MAX(id)` is
+                            // set to `Null`.
+                            row.get::<_, Option<u64>>(0)
                         }
-                    ).optional()?
+                    )
+                    .optional()?
+                    .flatten()
                 {
                     Some(last_chunk_identifier) => {
                         ChunkIdentifierGenerator::new_from_previous_chunk_identifier(
