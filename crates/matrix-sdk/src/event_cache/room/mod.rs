@@ -730,6 +730,7 @@ mod private {
             Ok(result
                 .map(|(events, reached_start)| ((events, reached_start), updates_as_vector_diffs)))
         }
+
         /// Removes the bundled relations from an event, if they were present.
         ///
         /// Only replaces the present if it contained bundled relations.

@@ -754,6 +754,12 @@ impl EventCacheStore for SqliteEventCacheStore {
         room_id: &RoomId,
         events: Vec<OwnedEventId>,
     ) -> Result<Vec<OwnedEventId>, Self::Error> {
+        // If there's no events for which we want to check duplicates, we can return
+        // early.
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Select all events that exist in the store, i.e. the duplicates.
         let room_id = room_id.to_owned();
         let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, &room_id);
@@ -2097,6 +2103,15 @@ mod tests {
                 });
             });
         }
+    }
+
+    #[async_test]
+    async fn test_filter_duplicate_events_no_events() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+
+        let room_id = *DEFAULT_TEST_ROOM_ID;
+        let duplicates = store.filter_duplicated_events(room_id, Vec::new()).await.unwrap();
+        assert!(duplicates.is_empty());
     }
 }
 
