@@ -425,7 +425,7 @@ impl RoomEventCacheInner {
         }
 
         let (events, duplicated_event_ids, all_duplicates) =
-            state.collect_valid_and_duplicated_events(sync_timeline_events.clone().into_iter());
+            state.collect_valid_and_duplicated_events(sync_timeline_events.clone()).await?;
 
         let sync_timeline_events_diffs = if all_duplicates {
             // No new events, thus no need to change the room events.
@@ -535,15 +535,10 @@ mod private {
     use matrix_sdk_common::executor::spawn;
     use once_cell::sync::OnceCell;
     use ruma::{serde::Raw, OwnedEventId, OwnedRoomId};
-    use tracing::{debug, error, instrument, trace, warn};
+    use tracing::{error, instrument, trace};
 
-    use super::{
-        super::{
-            deduplicator::{Decoration, Deduplicator},
-            EventCacheError,
-        },
-        events::RoomEvents,
-    };
+    use super::events::RoomEvents;
+    use crate::event_cache::{deduplicator::Deduplicator, EventCacheError};
 
     /// State for a single room's event cache.
     ///
@@ -586,10 +581,10 @@ mod private {
             room_id: OwnedRoomId,
             store: Arc<OnceCell<EventCacheStoreLock>>,
         ) -> Result<Self, EventCacheError> {
-            let events = if let Some(store) = store.get() {
-                let store = store.lock().await?;
+            let (events, deduplicator) = if let Some(store) = store.get() {
+                let locked = store.lock().await?;
 
-                let linked_chunk = match store
+                let linked_chunk = match locked
                     .load_last_chunk(&room_id)
                     .await
                     .map_err(EventCacheError::from)
@@ -603,20 +598,20 @@ mod private {
                         error!("error when reloading a linked chunk from memory: {err}");
 
                         // Clear storage for this room.
-                        store.handle_linked_chunk_updates(&room_id, vec![Update::Clear]).await?;
+                        locked.handle_linked_chunk_updates(&room_id, vec![Update::Clear]).await?;
 
                         // Restart with an empty linked chunk.
                         None
                     }
                 };
 
-                RoomEvents::with_initial_linked_chunk(linked_chunk)
+                (
+                    RoomEvents::with_initial_linked_chunk(linked_chunk),
+                    Deduplicator::new_store_based(room_id.clone(), store.clone()),
+                )
             } else {
-                RoomEvents::default()
+                (RoomEvents::default(), Deduplicator::new_memory_based())
             };
-
-            let deduplicator =
-                Deduplicator::with_initial_events(events.events().map(|(_pos, event)| event));
 
             Ok(Self {
                 room: room_id,
@@ -653,45 +648,16 @@ mod private {
         /// possibly misplace them. And we should not be missing
         /// events either: the already-known events would have their own
         /// previous-batch token (it might already be consumed).
-        pub fn collect_valid_and_duplicated_events<'a, I>(
-            &'a mut self,
-            events: I,
-        ) -> (Vec<Event>, Vec<OwnedEventId>, bool)
-        where
-            I: Iterator<Item = Event> + 'a,
-        {
-            let mut duplicated_event_ids = Vec::new();
-
-            let events = self
-                .deduplicator
-                .scan_and_learn(events, &self.events)
-                .filter_map(|decorated_event| match decorated_event {
-                    Decoration::Unique(event) => Some(event),
-                    Decoration::Duplicated(event) => {
-                        debug!(event_id = ?event.event_id(), "Found a duplicated event");
-
-                        duplicated_event_ids.push(
-                            event
-                                .event_id()
-                                // SAFETY: An event with no ID is decorated as
-                                // `Decoration::Invalid`. Thus, it's
-                                // safe to unwrap the `Option<OwnedEventId>` here.
-                                .expect("The event has no ID"),
-                        );
-
-                        // Keep the new event!
-                        Some(event)
-                    }
-                    Decoration::Invalid(event) => {
-                        warn!(?event, "Found an event with no ID");
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+        pub async fn collect_valid_and_duplicated_events(
+            &mut self,
+            events: Vec<Event>,
+        ) -> Result<(Vec<Event>, Vec<OwnedEventId>, bool), EventCacheError> {
+            let (events, duplicated_event_ids) =
+                self.deduplicator.filter_duplicate_events(events, &self.events).await?;
 
             let all_duplicates = !events.is_empty() && events.len() == duplicated_event_ids.len();
 
-            (events, duplicated_event_ids, all_duplicates)
+            Ok((events, duplicated_event_ids, all_duplicates))
         }
 
         /// Load more events backwards if the last chunk is **not** a gap.
