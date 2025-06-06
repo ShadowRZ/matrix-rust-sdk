@@ -1770,6 +1770,8 @@ impl Client {
             )
             .to_string();
 
+        error!("[BENOIT] Fetching client well-known from {server_url_string}");
+
         let well_known = self
             .inner
             .http_client

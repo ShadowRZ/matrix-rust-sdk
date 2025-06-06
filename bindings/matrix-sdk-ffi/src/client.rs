@@ -1495,6 +1495,7 @@ impl Client {
 
     /// Checks if the server supports the LiveKit RTC focus for placing calls.
     pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
+        tracing::error!("[BENOIT] RTC foci: {:?}", self.inner.rtc_foci().await?);
         Ok(self
             .inner
             .rtc_foci()
