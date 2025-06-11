@@ -2,16 +2,18 @@ use std::{ops::Deref, sync::Arc};
 
 use color_eyre::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use imbl::Vector;
 use input::MessageOrCommand;
 use invited_room::InvitedRoomView;
 use matrix_sdk::{
     locks::Mutex,
     ruma::{
         api::client::receipt::create_receipt::v3::ReceiptType,
-        events::room::message::RoomMessageEventContent, OwnedRoomId, UserId,
+        events::room::message::RoomMessageEventContent, OwnedEventId, OwnedRoomId, UserId,
     },
     Room, RoomState,
 };
+use matrix_sdk_ui::timeline::TimelineItem;
 use ratatui::{prelude::*, widgets::*};
 use tokio::{spawn, task::JoinHandle};
 
@@ -27,6 +29,12 @@ mod invited_room;
 mod timeline;
 
 const DEFAULT_TILING_DIRECTION: Direction = Direction::Horizontal;
+
+pub struct DetailsState<'a> {
+    selected_room: Option<&'a Room>,
+    timeline_items: Option<&'a Vector<Arc<TimelineItem>>>,
+    selected_event: Option<OwnedEventId>,
+}
 
 enum Mode {
     Normal { invited_room_view: Option<InvitedRoomView> },
@@ -386,6 +394,18 @@ impl RoomView {
         }
     }
 
+    fn get_selected_event_id(&self) -> Option<OwnedEventId> {
+        let selected = self.timeline_list.selected()?;
+        let selected_room = self.selected_room.as_deref()?;
+
+        let timelines = self.timelines.lock();
+        let current_timeline = timelines.get(selected_room)?;
+        let items = current_timeline.items.lock();
+        let item = items.get(selected)?;
+
+        item.as_event()?.event_id().map(|e| e.to_owned())
+    }
+
     fn update(&mut self) {
         match &mut self.mode {
             Mode::Normal { invited_room_view } => {
@@ -434,6 +454,8 @@ impl Widget for &mut RoomView {
                 .render(middle_area, buf);
         };
 
+        let selected_event = self.get_selected_event_id();
+
         if let Some(room_id) = self.selected_room.as_deref() {
             let rooms = self.ui_rooms.lock();
             let mut maybe_room = rooms.get(room_id);
@@ -459,11 +481,24 @@ impl Widget for &mut RoomView {
 
                     let items =
                         self.timelines.lock().get(room_id).map(|timeline| timeline.items.clone());
+
                     if let Some(items) = items {
                         let items = items.lock();
-                        view.render(details_area, buf, &mut (maybe_room, Some(items.deref())));
+                        let mut state = DetailsState {
+                            selected_room: maybe_room,
+                            timeline_items: Some(items.deref()),
+                            selected_event,
+                        };
+
+                        view.render(details_area, buf, &mut state);
                     } else {
-                        view.render(details_area, buf, &mut (maybe_room, None));
+                        let mut state = DetailsState {
+                            selected_room: maybe_room,
+                            timeline_items: None,
+                            selected_event,
+                        };
+
+                        view.render(details_area, buf, &mut state);
                     }
 
                     Some(timeline_area)
