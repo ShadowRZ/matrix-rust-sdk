@@ -46,6 +46,7 @@ thiserror.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # keep in sync with uniffi dependency in matrix-sdk-ffi, and uniffi_bindgen in ffi CI job
 uniffi = { workspace = true, features = ["cli"] }
+uniffi-bindgen-kotlin-jni.workspace = true
 vodozemac.workspace = true
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 

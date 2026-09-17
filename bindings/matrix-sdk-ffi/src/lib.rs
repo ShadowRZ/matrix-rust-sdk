@@ -5,6 +5,9 @@
 // Needed because uniffi generates a big const array.
 #![allow(clippy::large_const_arrays)]
 
+// For Kotlin Native Bindgen
+include!(concat!(env!("OUT_DIR"), "/uniffi_bindgen_kotlin_jni.uniffi.rs"));
+
 mod authentication;
 mod chunk_iterator;
 mod client;
@@ -51,7 +54,7 @@ use self::{
     task_handle::TaskHandle,
 };
 
-uniffi::include_scaffolding!("api");
+// uniffi::include_scaffolding!("api");
 
 #[matrix_sdk_ffi_macros::export]
 fn sdk_git_sha() -> String {

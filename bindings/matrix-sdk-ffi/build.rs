@@ -96,7 +96,7 @@ fn get_clang_major_version(clang_path: &Path) -> String {
 fn main() -> Result<(), Box<dyn Error>> {
     setup_x86_64_android_workaround();
     setup_watchos_simulator_workaround();
-    uniffi::generate_scaffolding("./src/api.udl").expect("Building the UDL file failed");
+    uniffi_bindgen_kotlin_jni::generate_scaffolding();
 
     let git_config = Gitcl::builder().sha(true).build();
     Emitter::default().add_instructions(&git_config)?.emit()?;

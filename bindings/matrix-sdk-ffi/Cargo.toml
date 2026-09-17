@@ -113,6 +113,7 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-core.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uniffi-bindgen-kotlin-jni-runtime.workspace = true
 url.workspace = true
 uuid = { version = "1.26.1", default-features = false, features = ["std", "v4"] }
 zeroize.workspace = true
@@ -149,6 +150,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
+uniffi-bindgen-kotlin-jni.workspace = true
 vergen-gitcl = { workspace = true, features = ["build"] }
 
 [lints]

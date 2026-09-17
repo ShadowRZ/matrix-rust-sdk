@@ -1,3 +1,3 @@
-fn main() {
-    uniffi::uniffi_bindgen_main()
+fn main() -> anyhow::Result<()> {
+    uniffi_bindgen_kotlin_jni::main()
 }
